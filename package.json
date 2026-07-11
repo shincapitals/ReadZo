@@ -4,9 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n server,client -c yellow,cyan \"npm:dev:server\" \"npm:dev:client\"",
+    "dev": "concurrently -k -n tts,server,client -c magenta,yellow,cyan \"npm:dev:tts\" \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite --port=3000 --host=0.0.0.0",
     "dev:server": "tsx watch server.ts",
+    "dev:tts": "tts-server\\.venv\\Scripts\\python.exe tts-server\\main.py",
     "build": "vite build",
     "serve": "tsx server.ts",
     "start": "npm run build && npm run serve",

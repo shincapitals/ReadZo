@@ -2,7 +2,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Modality } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 
 // Load config from .env.local first (local dev), then fall back to .env. Neither
 // overrides variables already present in the environment (e.g. injected by Cloud Run).
@@ -12,9 +12,9 @@ dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 type TranslationStyle = 'chuẩn' | 'genz';
-type VoiceName = 'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr';
 
-const VOICES: VoiceName[] = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'];
+// VieNeu-TTS sidecar (Python/FastAPI, holds the model). See tts-server/main.py.
+const TTS_URL = process.env.TTS_URL || 'http://127.0.0.1:4100';
 
 // Auth modes:
 //   - Vertex AI (bills to Google Cloud, e.g. Trial GenAI Credit): set GOOGLE_GENAI_USE_VERTEXAI=true
@@ -108,38 +108,49 @@ app.post('/api/translate', async (req, res) => {
   }
 });
 
+// TTS is handled by the VieNeu-TTS Python sidecar; Express just proxies to it.
+// The sidecar returns a full 48kHz WAV as base64 (the client uses it directly).
 app.post('/api/tts', async (req, res) => {
   try {
-    const { text, voiceName } = req.body ?? {};
+    const { text, voiceName, style } = req.body ?? {};
     if (typeof text !== 'string' || !text.trim()) {
       return res.status(400).json({ error: 'Thiếu nội dung cần đọc.' });
     }
-    const safeVoice: VoiceName = VOICES.includes(voiceName) ? voiceName : 'Kore';
 
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-tts-preview',
-      contents: [{ role: 'user', parts: [{ text }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: safeVoice },
-          },
-        },
-      },
+    const upstream = await fetch(`${TTS_URL}/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice: voiceName, style }),
     });
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Audio) {
-      throw new Error('Không thể tạo audio từ văn bản.');
+    if (!upstream.ok) {
+      const detail = await upstream.text().catch(() => '');
+      throw new Error(`TTS sidecar lỗi ${upstream.status}: ${detail.slice(0, 200)}`);
     }
 
-    // Raw PCM (16-bit LE, mono, 24kHz) as base64. The client wraps it in a WAV header.
-    res.json({ audio: base64Audio });
+    const data = (await upstream.json()) as { audio?: string; error?: string };
+    if (data.error) throw new Error(data.error);
+    if (!data.audio) throw new Error('Không thể tạo audio từ văn bản.');
+
+    res.json({ audio: data.audio });
   } catch (err: any) {
     console.error('tts error:', err);
-    res.status(500).json({ error: err?.message || 'Lỗi khi tạo audio.' });
+    const offline = /fetch failed|ECONNREFUSED/i.test(err?.message || '');
+    res.status(offline ? 503 : 500).json({
+      error: offline
+        ? 'Máy chủ giọng đọc (VieNeu) chưa sẵn sàng. Vui lòng đợi model tải xong rồi thử lại.'
+        : err?.message || 'Lỗi khi tạo audio.',
+    });
+  }
+});
+
+// Expose the sidecar's voice catalog to the client.
+app.get('/api/voices', async (_req, res) => {
+  try {
+    const upstream = await fetch(`${TTS_URL}/voices`);
+    res.json(await upstream.json());
+  } catch {
+    res.status(503).json({ error: 'TTS sidecar chưa sẵn sàng.' });
   }
 });
 

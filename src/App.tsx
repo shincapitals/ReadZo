@@ -16,10 +16,12 @@ import {
 import { parsePDF, extractPageText, ParsedPDF } from './lib/pdf';
 import {
   translateText,
-  generateRawTTS,
-  pcmToWavBlob,
+  generateTTSBlob,
   TranslationStyle,
   VoiceName,
+  ReadingStyle,
+  VIENEU_VOICES,
+  READING_STYLE_LABELS,
 } from './lib/ai';
 import {
   PageStatus,
@@ -37,7 +39,6 @@ import {
   touchDocMeta,
 } from './lib/db';
 import { runPool } from './lib/pool';
-import { chunkText } from './lib/text';
 import { motion } from 'motion/react';
 import Markdown from 'react-markdown';
 
@@ -107,7 +108,8 @@ export default function App() {
   const [fontSize, setFontSize] = useState<number>(settings.fontSize ?? 16);
 
   // TTS / playlist state
-  const [voice, setVoice] = useState<VoiceName>(settings.voice ?? 'Kore');
+  const [voice, setVoice] = useState<VoiceName>(settings.voice ?? 'Phạm Tuyên');
+  const [readingStyle, setReadingStyle] = useState<ReadingStyle>(settings.readingStyle ?? 'tu_nhien');
   const [speed, setSpeed] = useState<number>(settings.speed ?? 1.2);
   const [activeAudioSegment, setActiveAudioSegment] = useState<number | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -118,13 +120,24 @@ export default function App() {
   const [audioDuration, setAudioDuration] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Background audio pre-generation (VieNeu is slow, so warm the cache after translating).
+  const [pregen, setPregen] = useState<{ done: number; total: number } | null>(null);
+  const pregenRef = useRef<{ cancel: boolean }>({ cancel: false });
+
   const segmentsRef = useRef<Segment[]>([]);
   const playlistRef = useRef<number[]>([]);
   const playlistIdxRef = useRef<number>(-1);
   const objectUrlRef = useRef<string | null>(null);
+  const voiceRef = useRef(voice);
+  const styleRef = useRef(readingStyle);
+  voiceRef.current = voice;
+  styleRef.current = readingStyle;
 
   const docHash = activeDoc?.hash ?? '';
   const docName = activeDoc?.name ?? '';
+
+  // Audio cache key combines the voice + reading style (different combos = different audio).
+  const audioKey = (v: VoiceName, st: ReadingStyle) => `${v}__${st}`;
 
   useEffect(() => {
     segmentsRef.current = segments;
@@ -135,11 +148,17 @@ export default function App() {
     const id = setTimeout(() => {
       localStorage.setItem(
         SETTINGS_KEY,
-        JSON.stringify({ startPage, endPage, style, fontSize, voice, speed }),
+        JSON.stringify({ startPage, endPage, style, fontSize, voice, readingStyle, speed }),
       );
     }, 400);
     return () => clearTimeout(id);
-  }, [startPage, endPage, style, fontSize, voice, speed]);
+  }, [startPage, endPage, style, fontSize, voice, readingStyle, speed]);
+
+  // Changing voice/style invalidates the audio cache key, so stop any in-flight pre-generation.
+  useEffect(() => {
+    pregenRef.current.cancel = true;
+    setPregen(null);
+  }, [voice, readingStyle]);
 
   const refreshDocuments = () => listDocuments().then(setDocuments).catch(() => {});
   useEffect(() => {
@@ -168,29 +187,44 @@ export default function App() {
     setPlaylistPos({ idx: -1, total: 0 });
   };
 
-  // Get the cached audio Blob for a page, generating (and caching) it if missing.
+  // Get the cached audio Blob for a page, generating (and caching) it via the VieNeu sidecar
+  // if missing. The sidecar handles long-text chunking and returns a full 48kHz WAV.
   const ensurePageAudio = async (pageNo: number): Promise<Blob> => {
-    const cached = await getAudio(docHash, pageNo, voice);
+    const v = voiceRef.current;
+    const st = styleRef.current;
+    const key = audioKey(v, st);
+    const cached = await getAudio(docHash, pageNo, key);
     if (cached) return cached.blob;
 
     const seg = segmentsRef.current.find((s) => s.pageNumber === pageNo);
     const txt = seg?.translated;
     if (!txt || !txt.trim()) throw new Error('Trang không có nội dung để đọc.');
 
-    const chunks = chunkText(txt);
-    const pcms: Uint8Array[] = [];
-    for (const c of chunks) pcms.push(await generateRawTTS(c, voice));
-
-    const total = pcms.reduce((a, p) => a + p.length, 0);
-    const merged = new Uint8Array(total);
-    let offset = 0;
-    for (const p of pcms) {
-      merged.set(p, offset);
-      offset += p.length;
-    }
-    const blob = pcmToWavBlob(merged);
-    await putAudio({ docHash, pageNo, voice, blob, updatedAt: Date.now() });
+    const blob = await generateTTSBlob(txt, v, st);
+    await putAudio({ docHash, pageNo, voice: key, blob, updatedAt: Date.now() });
     return blob;
+  };
+
+  // Warm the audio cache for a set of pages in the background (sequential — the sidecar
+  // serializes CPU inference anyway). Cancels when voice/style changes or a new translate starts.
+  const pregenerateAudio = async (pageNos: number[]) => {
+    pregenRef.current.cancel = false;
+    const todo = pageNos.filter((p) => {
+      const seg = segmentsRef.current.find((s) => s.pageNumber === p);
+      return seg?.translated && seg.translated.trim();
+    });
+    if (!todo.length) return;
+    setPregen({ done: 0, total: todo.length });
+    for (let i = 0; i < todo.length; i++) {
+      if (pregenRef.current.cancel) break;
+      try {
+        await ensurePageAudio(todo[i]);
+      } catch {
+        /* skip pages that fail; user can retry by listening */
+      }
+      setPregen({ done: i + 1, total: todo.length });
+    }
+    setPregen(null);
   };
 
   const playFrom = async (idx: number) => {
@@ -384,6 +418,7 @@ export default function App() {
 
     setTranslateError('');
     stopAudio();
+    pregenRef.current.cancel = true; // supersede any running pre-generation
 
     // Build the view: prior work (all done/error pages) + the selected range.
     const existing = await getDocPages(docHash, style);
@@ -420,6 +455,11 @@ export default function App() {
     if (failed > 0) setTranslateError(`Có ${failed} trang bị lỗi. Bấm thử lại trên từng trang.`);
     await touchDocMeta(docHash);
     refreshDocuments();
+
+    // Warm the audio cache for the whole range in the background so playback is instant later.
+    const rangePages: number[] = [];
+    for (let p = startPage; p <= endPage; p++) rangePages.push(p);
+    pregenerateAudio(rangePages);
   };
 
   const retryPage = async (pageNo: number) => {
@@ -726,18 +766,39 @@ export default function App() {
                 </div>
 
                 <div className="space-y-1">
-                  <label className="text-[10px] font-black uppercase opacity-50">Giọng đọc</label>
+                  <label className="text-[10px] font-black uppercase opacity-50">
+                    Giọng đọc (VieNeu · 48kHz)
+                  </label>
                   <select
                     value={voice}
                     onChange={(e) => setVoice(e.target.value as VoiceName)}
                     className="w-full border-2 border-black p-2 text-sm font-bold bg-white"
                   >
-                    <option value="Kore">Miền Nam (Dễ thương)</option>
-                    <option value="Puck">Miền Nam (Trẻ trung)</option>
-                    <option value="Charon">Miền Bắc (Nam mạnh)</option>
-                    <option value="Fenrir">Miền Bắc (Nữ chuẩn)</option>
-                    <option value="Zephyr">Trung lập</option>
+                    {(['tu_nhien', 'tin_tuc', 'doc_truyen'] as ReadingStyle[]).map((st) => (
+                      <optgroup key={st} label={READING_STYLE_LABELS[st]}>
+                        {VIENEU_VOICES.filter((v) => v.style === st).map((v) => (
+                          <option key={v.name} value={v.name}>
+                            {v.name} · {v.gender} · {v.region}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
                   </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black uppercase opacity-50">Kiểu đọc</label>
+                  <div className="grid grid-cols-3 gap-1 bg-gray-100 p-1 border-2 border-black">
+                    {(['tu_nhien', 'tin_tuc', 'doc_truyen'] as ReadingStyle[]).map((st) => (
+                      <button
+                        key={st}
+                        onClick={() => setReadingStyle(st)}
+                        className={`py-1.5 text-[11px] font-black uppercase border-2 ${readingStyle === st ? 'bg-black text-white border-black' : 'border-transparent hover:border-black/20'}`}
+                      >
+                        {READING_STYLE_LABELS[st]}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 <div className="space-y-1">
@@ -781,6 +842,22 @@ export default function App() {
                   onTimeUpdate={(e) => setAudioProgress(e.currentTarget.currentTime)}
                   onLoadedMetadata={(e) => setAudioDuration(e.currentTarget.duration)}
                 />
+              )}
+
+              {pregen && (
+                <div className="flex items-center gap-2 mb-3 shrink-0 bg-[#FEF3C7] border-2 border-black px-3 py-2 text-[11px] font-black uppercase text-black">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Đang tạo audio nền: {pregen.done}/{pregen.total} trang
+                  <button
+                    onClick={() => {
+                      pregenRef.current.cancel = true;
+                      setPregen(null);
+                    }}
+                    className="ml-auto underline hover:no-underline"
+                  >
+                    Dừng
+                  </button>
+                </div>
               )}
 
               {segments.length > 0 && !isTranslating && (

@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# VieNeu-TTS sidecar: local Python env, model cache, and scratch files
+tts-server/.venv/
+tts-server/hf-cache/
+tts-server/_*.py
+tts-server/*.wav
